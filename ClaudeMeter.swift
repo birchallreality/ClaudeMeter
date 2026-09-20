@@ -3,11 +3,15 @@ import ServiceManagement
 import os
 
 let log = Logger(subsystem: "com.isaac.claudemeter", category: "fetch")
+let lockoutKey = "rateLimitedUntil"
 
 // MARK: - Data
 
 let sessionLength: TimeInterval = 5 * 3600
 let weekLength: TimeInterval = 7 * 86400
+/// Base poll interval. Kept well off 1 minute (1,440 requests/day) because the endpoint is
+/// undocumented and its quota is unknown — it returns no `anthropic-ratelimit-*` headers.
+let pollInterval: TimeInterval = 300
 
 struct Window: Decodable {
     let utilization: Double
@@ -39,9 +43,17 @@ enum FetchError: Error, Equatable {
     case rateLimited(retryAfter: TimeInterval?)
 }
 
-/// Reads Claude Code's OAuth token via the `security` CLI (same tool Claude Code uses,
+struct Credential {
+    let token: String
+    let expiresAt: Date?
+    /// Claude Code refreshes this in the background. Once it has lapsed we are not signed in right
+    /// now, and asking anyway comes back 429 — indistinguishable from real rate limiting.
+    var hasExpired: Bool { expiresAt.map { $0 <= Date() } ?? false }
+}
+
+/// Reads Claude Code's OAuth credential via the `security` CLI (same tool Claude Code uses,
 /// so no Keychain prompt and nothing breaks on rebuild).
-func readToken() -> String? {
+func readCredential() -> Credential? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
     p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
@@ -53,15 +65,20 @@ func readToken() -> String? {
     p.waitUntilExit()
     guard p.terminationStatus == 0,
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let oauth = json["claudeAiOauth"] as? [String: Any]
+          let oauth = json["claudeAiOauth"] as? [String: Any],
+          let token = oauth["accessToken"] as? String
     else { return nil }
-    return oauth["accessToken"] as? String
+    // expiresAt is milliseconds since the epoch.
+    let expiresAt = (oauth["expiresAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
+    return Credential(token: token, expiresAt: expiresAt)
 }
 
 func fetchUsage() async -> Result<Usage, FetchError> {
-    guard let token = readToken() else { return .failure(.signedOut) }
+    // A missing or lapsed token is a sign-out, not a rate limit. Deciding that here keeps the
+    // two apart and skips a request that would only come back 429.
+    guard let cred = readCredential(), !cred.hasExpired else { return .failure(.signedOut) }
     var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.setValue("Bearer \(cred.token)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     req.timeoutInterval = 15
     guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return .failure(.offline) }
@@ -119,8 +136,9 @@ let meterTrack = dynamic(light: .black.withAlphaComponent(0.12), dark: .white.wi
 
 // MARK: - Formatting
 
-func countdown(to date: Date) -> String {
-    let mins = max(0, Int(date.timeIntervalSinceNow / 60))
+func countdown(to date: Date) -> String { duration(date.timeIntervalSinceNow) }
+func duration(_ seconds: TimeInterval) -> String {
+    let mins = max(0, Int(seconds / 60))
     let (d, h, m) = (mins / 1440, mins / 60 % 24, mins % 60)
     if d > 0 { return "\(d)d\(h)h" }
     if h > 0 { return "\(h)h\(String(format: "%02d", m))m" }
@@ -267,6 +285,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var nextFetch = Date.distantPast
     var failures = 0
     var fetching = false
+    /// When the current unbroken run of 429s began. The endpoint answers 429 for a rejected token
+    /// as well as for real throttling, so a run that outlasts any plausible throttle is worth saying
+    /// out loud rather than insisting it is rate limiting.
+    var rateLimitedSince: Date?
+    /// When an outstanding 429 lockout expires. Persisted: a lockout outlives the process,
+    /// and it must survive a `signedOut` reply, which resets `failures` but not this.
+    var rateLimitedUntil = Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: lockoutKey))
     var appearanceObservation: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -279,7 +304,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Task { @MainActor in self?.render() }
         }
         render()
-        refresh()
+        nextFetch = rateLimitedUntil
+        tick()
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
             Task { @MainActor in self.tick() }
         }
@@ -299,17 +325,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 usage = u
                 error = nil
                 failures = 0
+                rateLimitedUntil = .distantPast
+                rateLimitedSince = nil
             case .failure(let e):
                 error = e
                 // A 401 means the network is fine, so only back off on offline / rate-limited.
                 failures = e == .signedOut ? 0 : failures + 1
             }
-            // 1m normally; after failures 2m, 4m, 8m… capped at 15m, never sooner than Retry-After.
-            var delay = min(60 * pow(2, Double(failures)), 900)
-            if case .rateLimited(let after?) = error { delay = max(delay, after) }
-            nextFetch = Date() + delay
+            // 5m normally; after failures 10m, 20m, 40m, then 1h (the cap).
+            let delay = min(pollInterval * pow(2, Double(failures)), 3600)
+            // A 429 sets a hard floor. The extra minute is margin: retrying the instant
+            // Retry-After elapses has repeatedly come straight back as another 429.
+            if case .rateLimited(let after) = error {
+                rateLimitedUntil = Date() + (after ?? delay) + 60
+                rateLimitedSince = rateLimitedSince ?? Date()
+            }
+            // `failures` can be reset by a signedOut mid-lockout, so clamp to the lockout too.
+            nextFetch = max(Date() + delay, rateLimitedUntil)
+            if rateLimitedUntil > Date() {
+                UserDefaults.standard.set(rateLimitedUntil.timeIntervalSince1970, forKey: lockoutKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: lockoutKey)
+            }
             if let error {
-                log.notice("fetch failed: \(String(describing: error), privacy: .public), retry in \(Int(delay))s")
+                let wait = Int(nextFetch.timeIntervalSinceNow.rounded())
+                log.notice("fetch failed: \(String(describing: error), privacy: .public), retry in \(wait)s")
             }
             fetching = false
             render()
@@ -356,7 +396,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var retryNote: String? {
         switch error {
         case .offline: "Can't reach Anthropic · retrying in \(countdown(to: nextFetch))"
-        case .rateLimited: "Rate limited · retrying in \(countdown(to: nextFetch))"
+        case .rateLimited:
+            // An expired token also answers 429, so don't keep blaming the rate limit forever.
+            if let since = rateLimitedSince, Date().timeIntervalSince(since) > 3600 {
+                "Rate limited \(duration(Date().timeIntervalSince(since))) · check you're signed in to Claude Code"
+            } else {
+                "Rate limited · retrying in \(countdown(to: nextFetch))"
+            }
         default: nil
         }
     }

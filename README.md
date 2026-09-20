@@ -24,9 +24,10 @@ You need to be signed in to Claude Code with a Pro or Max account. There's no AP
 
 ## How it works
 
-- **Data:** it reads the login token Claude Code already keeps in the Keychain (`Claude Code-credentials`). It uses that token to call the same usage endpoint behind Claude Code's `/usage` command. The token only goes to `api.anthropic.com`, and it's never stored.
-- **Updates:** it fetches once a minute.
-- **Backoff:** if a request fails or gets rate-limited (HTTP 429), it waits 2m, then 4m, 8m, up to 15m, and never retries sooner than the server's `Retry-After` header. The menu shows when the next retry is. **Refresh** (⌘R) retries right away.
+- **Data:** it reads the login token Claude Code already keeps in the Keychain (`Claude Code-credentials`), including when that token expires. It uses that token to call the same usage endpoint behind Claude Code's `/usage` command. The token only goes to `api.anthropic.com`, and it's never stored.
+- **Updates:** it fetches every 5 minutes. The pace line still moves every minute between fetches.
+- **Backoff:** if a request fails it waits 10m, 20m, 40m, then 1h (the cap). A rate limit (HTTP 429) is held until the server's `Retry-After` has passed, plus a minute so the retry doesn't land on the window boundary; that wait survives a restart and a failed token read. The menu shows when the next retry is. **Refresh** (⌘R) retries right away.
+- **Signed out vs rate limited:** the endpoint answers HTTP 429 to an expired token as well as to real throttling, so the two look identical from the outside. The app checks the token's own expiry first and says *Open Claude Code to sign in* rather than sending a request that would come back as a misleading 429. If a rate limit does outlast an hour, the dropdown starts suggesting you check you're signed in.
 - **Caveat:** the endpoint isn't a public API, so it could change without notice.
 
 To see failed or rate-limited fetches:
