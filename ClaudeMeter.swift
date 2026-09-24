@@ -73,10 +73,44 @@ func readCredential() -> Credential? {
     return Credential(token: token, expiresAt: expiresAt)
 }
 
+/// The Claude Code CLI, if installed. Only the CLI refreshes the Keychain token. The desktop app
+/// keeps its own copy, so with only the desktop app in use the token lapses after about 8 hours.
+func claudeCLI() -> URL? {
+    ["~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        .map { URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath) }
+        .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+}
+
+nonisolated(unsafe) var lastCLIRefresh = Date.distantPast
+
+/// Asks the CLI to refresh the Keychain token (we never refresh it ourselves). `claude -p ""`
+/// refreshes, then exits with "Input must be provided" before any model call, so it costs no quota.
+/// Throttled so a real sign-out doesn't spawn the CLI every tick.
+func refreshViaCLI() {
+    guard Date().timeIntervalSince(lastCLIRefresh) > 600, let cli = claudeCLI() else { return }
+    lastCLIRefresh = Date()
+    let p = Process()
+    p.executableURL = cli
+    p.arguments = ["-p", ""]
+    p.currentDirectoryURL = FileManager.default.temporaryDirectory
+    p.standardInput = FileHandle.nullDevice
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 20) { if p.isRunning { p.terminate() } }
+    p.waitUntilExit()
+    log.notice("asked the CLI to refresh the token (exit \(p.terminationStatus))")
+}
+
 func fetchUsage() async -> Result<Usage, FetchError> {
+    var cred = readCredential()
+    if cred?.hasExpired == true {
+        refreshViaCLI()
+        cred = readCredential()
+    }
     // A missing or lapsed token is a sign-out, not a rate limit. Deciding that here keeps the
     // two apart and skips a request that would only come back 429.
-    guard let cred = readCredential(), !cred.hasExpired else { return .failure(.signedOut) }
+    guard let cred, !cred.hasExpired else { return .failure(.signedOut) }
     var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
     req.setValue("Bearer \(cred.token)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
@@ -376,7 +410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         if error == .signedOut {
-            menu.addItem(info("Open Claude Code to sign in"))
+            menu.addItem(info(claudeCLI() == nil ? "Install Claude Code CLI, run claude once"
+                                                  : "Run claude in Terminal to sign in"))
         } else if let u = usage {
             if u.five_hour != nil { menu.addItem(sessionItem) }
             if u.seven_day != nil { menu.addItem(weekItem) }

@@ -20,14 +20,15 @@ Click it to see a Session section and a Week section. Each has a meter, when it 
 
 Then choose **Open at Login** from its menu. The app has no Dock icon.
 
-You need to be signed in to Claude Code with a Pro or Max account. There's no API key to set up.
+You need a Pro or Max account and the Claude Code **command-line tool** installed and signed in (run `claude` in Terminal once). There's no API key to set up. This applies even if you use Claude Code through the Claude desktop app: the desktop app keeps its own login and doesn't renew the one ClaudeMeter reads, so ClaudeMeter uses the command-line tool to renew it (see below).
 
 ## How it works
 
 - **Data:** it reads the login token Claude Code already keeps in the Keychain (`Claude Code-credentials`), including when that token expires. It uses that token to call the same usage endpoint behind Claude Code's `/usage` command. The token only goes to `api.anthropic.com`, and it's never stored.
+- **Keeping the login fresh:** the token lasts about 8 hours, and only the terminal `claude` tool renews it. When it has expired, ClaudeMeter runs `claude -p ""` in the background, which renews the token and then exits before calling the model, so it uses none of your quota. It tries at most once every 10 minutes. ClaudeMeter never renews or saves the token itself.
 - **Updates:** it fetches every 5 minutes. The pace line still moves every minute between fetches.
 - **Backoff:** if a request fails it waits 10m, 20m, 40m, then 1h (the cap). A rate limit (HTTP 429) is held until the server's `Retry-After` has passed, plus a minute so the retry doesn't land on the window boundary; that wait survives a restart and a failed token read. The menu shows when the next retry is. **Refresh** (⌘R) retries right away.
-- **Signed out vs rate limited:** the endpoint answers HTTP 429 to an expired token as well as to real throttling, so the two look identical from the outside. The app checks the token's own expiry first and says *Open Claude Code to sign in* rather than sending a request that would come back as a misleading 429. If a rate limit does outlast an hour, the dropdown starts suggesting you check you're signed in.
+- **Signed out vs rate limited:** the endpoint answers HTTP 429 to an expired token as well as to real throttling, so the two look identical from the outside. The app checks the token's own expiry first and says *Run claude in Terminal to sign in* rather than sending a request that would come back as a misleading 429. If a rate limit does outlast an hour, the dropdown starts suggesting you check you're signed in.
 - **Caveat:** the endpoint isn't a public API, so it could change without notice.
 
 To see failed or rate-limited fetches:
