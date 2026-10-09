@@ -305,6 +305,49 @@ final class SectionView: NSView {
     }
 }
 
+/// Bottom row of the usage block: when the data was fetched, and a Refresh button. A button inside a
+/// menu item's view doesn't dismiss the menu, so refreshing keeps it open and the values update in place.
+final class FooterView: NSView {
+    var updated: Date? { didSet { needsDisplay = true } }
+    var next: Date? { didSet { needsDisplay = true } }
+    var fetching = false { didSet { button.isEnabled = !fetching; needsDisplay = true } }
+    let button: NSButton
+
+    init(target: AnyObject, action: Selector) {
+        button = NSButton(title: "Refresh", image: NSImage(systemSymbolName: "arrow.clockwise",
+                          accessibilityDescription: nil)!, target: target, action: action)
+        button.bezelStyle = .accessoryBarAction
+        button.showsBorderOnlyWhileMouseInside = true
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 11)
+        button.imagePosition = .imageLeading
+        button.sizeToFit()
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 28))
+        // The bezel is padded; this lines its label up with the 14pt text margin.
+        button.setFrameOrigin(NSPoint(x: bounds.width - 4 - button.frame.width,
+                                      y: ((bounds.height - button.frame.height) / 2).rounded()))
+        addSubview(button)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        var s = ""
+        if fetching {
+            s = "Refreshing…"
+        } else if let updated {
+            let secs = Date().timeIntervalSince(updated)
+            s = "Updated " + (secs < 60 ? "\(max(0, Int(secs)))s" : duration(secs)) + " ago"
+            if let next { s += " · next in \(countdown(to: next))" }
+        }
+        let a = NSAttributedString(string: s, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
+        a.draw(at: NSPoint(x: 14, y: ((bounds.height - a.size().height) / 2).rounded()))
+    }
+}
+
 // MARK: - App
 
 @MainActor
@@ -314,6 +357,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let weekView = SectionView(title: "Week", length: weekLength)
     lazy var sessionItem = viewItem(sessionView)
     lazy var weekItem = viewItem(weekView)
+    lazy var footer = FooterView(target: self, action: #selector(refreshAction))
+    lazy var footerItem = viewItem(footer)
+    /// Last successful fetch.
+    var updated: Date?
+    /// Ticks the footer while the menu is open (the 60s timer is too coarse for a seconds count).
+    var openTimer: Timer?
     var usage: Usage?
     var error: FetchError?
     var nextFetch = Date.distantPast
@@ -340,9 +389,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
         nextFetch = rateLimitedUntil
         tick()
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+        // Common modes, so it keeps firing while the menu is open (event-tracking mode).
+        RunLoop.main.add(Timer(timeInterval: 60, repeats: true) { _ in
             Task { @MainActor in self.tick() }
-        }
+        }, forMode: .common)
     }
 
     /// Every minute: fetch if due (backoff may push that out), otherwise just redraw the pace line.
@@ -353,10 +403,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func refresh() {
         guard !fetching else { return }
         fetching = true
+        footer.fetching = true
         Task {
             switch await fetchUsage() {
             case .success(let u):
                 usage = u
+                updated = Date()
                 error = nil
                 failures = 0
                 rateLimitedUntil = .distantPast
@@ -387,6 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             fetching = false
             render()
+            if let menu = item.menu, openTimer != nil { updateContent(menu) }
         }
     }
 
@@ -402,30 +455,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.appearsDisabled = error != nil
         sessionView.data = session
         weekView.data = usage?.seven_day
+        footer.updated = updated
+        footer.next = error == nil ? nextFetch : nil
+        footer.fetching = fetching
     }
 
     // Rebuilt every time the menu opens; section views update live after a refresh.
     func menuNeedsUpdate(_ menu: NSMenu) {
-        tick()
         menu.removeAllItems()
-
-        if error == .signedOut {
-            menu.addItem(info(claudeCLI() == nil ? "Install Claude Code CLI, run claude once"
-                                                  : "Run claude in Terminal to sign in"))
-        } else if let u = usage {
-            if u.five_hour != nil { menu.addItem(sessionItem) }
-            if u.seven_day != nil { menu.addItem(weekItem) }
-            if let note = retryNote { menu.addItem(info(note)) }
-        } else {
-            menu.addItem(info(retryNote ?? "Loading…"))
-        }
-
+        menu.addItem(footerItem)
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Refresh", action: #selector(refreshAction), keyEquivalent: "r").target = self
         let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(withTitle: "Quit ClaudeMeter", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        updateContent(menu)
+        tick()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        let t = Timer(timeInterval: 1, repeats: true) { _ in
+            Task { @MainActor in self.footer.needsDisplay = true }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        openTimer = t
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        openTimer?.invalidate()
+        openTimer = nil
+    }
+
+    /// The items above the footer. Swapped on their own after a refresh while the menu is open,
+    /// so the footer row (and the pointer on its button) stays put.
+    func updateContent(_ menu: NSMenu) {
+        while let first = menu.items.first, first !== footerItem { menu.removeItem(first) }
+        var items: [NSMenuItem] = []
+        if error == .signedOut {
+            items.append(info(claudeCLI() == nil ? "Install Claude Code CLI, run claude once"
+                                                 : "Run claude in Terminal to sign in"))
+        } else if let u = usage {
+            if u.five_hour != nil { items.append(sessionItem) }
+            if u.seven_day != nil { items.append(weekItem) }
+            if let note = retryNote { items.append(info(note)) }
+        } else {
+            items.append(info(retryNote ?? "Loading…"))
+        }
+        for (i, mi) in items.enumerated() { menu.insertItem(mi, at: i) }
     }
 
     private var retryNote: String? {
